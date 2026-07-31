@@ -1,0 +1,7 @@
+streamlit
+requests
+yfinance
+numpy
+pandas
+plotly
+websocket-client
