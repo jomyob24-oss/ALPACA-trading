@@ -231,7 +231,24 @@ VOLUME_DROP_EXIT_PCT = 0.80  # exit a position if volume falls to 80% below its 
 # it last got stopped out at by more than just a fraction of a cent - that's
 # not a real breakout, it's the same chop repeating. Require it to clear by
 # at least this percentage to count as genuinely new.
-REENTRY_BREAKOUT_BUFFER_PCT = 0.07  # 7% above the last stopped-out high
+#
+# The required buffer scales with how extended the stock already is on the
+# day. A stock up "only" 100-150% chopping around has smaller, tighter
+# swings, so a 7% push back above the old high is a meaningful, real move.
+# But a stock up 250%+ (or into the hundreds/thousands of percent) swings
+# far more violently - a 7% wiggle there can be pure noise within the same
+# chop, so it needs a bigger, ~10-12% push to count as a genuine reclaim.
+REENTRY_BREAKOUT_BUFFER_PCT = 0.07  # base case: stock up ~150% or less
+REENTRY_BREAKOUT_BUFFER_PCT_EXTENDED = 0.12  # stock up ~250%+ on the day
+REENTRY_EXTENDED_PCT_THRESHOLD = 250.0  # % gain on the day that counts as "extended"
+
+
+def reentry_breakout_buffer(pct_change):
+    """Returns the required re-entry breakout buffer, scaled by how extended
+    (in % gain on the day) the stock already is."""
+    if pct_change is not None and pct_change >= REENTRY_EXTENDED_PCT_THRESHOLD:
+        return REENTRY_BREAKOUT_BUFFER_PCT_EXTENDED
+    return REENTRY_BREAKOUT_BUFFER_PCT
 
 POSITION_SIZE_PCT_OF_CASH = 0.25  # each trade risks 25% of current paper cash
 MAX_OPEN_POSITIONS = 3  # bot can hold up to this many positions at once
@@ -632,6 +649,42 @@ def is_staircasing_down(candles):
     return highs_descending and lows_descending
 
 
+REPEATED_REJECTION_TOUCH_PCT = 0.01     # a candle high within 1% of the day's high counts as "testing" it
+REPEATED_REJECTION_CLEAR_PCT = 0.01     # a close has to beat the day's high by this much to count as a genuine clear
+REPEATED_REJECTION_MIN_TOUCHES = 3      # this many separate tests of the high, all rejected, = pure chop, not a breakout
+
+
+def is_repeated_high_rejection(candles, day_high):
+    """Catches a stock that has tested the same daily high multiple separate
+    times over the course of the day - each time wicking up near it (or
+    slightly through it) and getting rejected back down, without ever
+    actually closing meaningfully above it. This is the FCUV pattern: 10am,
+    10:45am, 1:45pm, 2pm, 4:10pm all matched roughly the same high and got
+    rejected every time - a rollercoaster with no real breakout, not a
+    coiling setup building toward one. If this pattern is detected, entries
+    are paused even on the very FIRST attempt (stop_out_count == 0), since
+    waiting for one stop-out first would mean losing money on the very
+    whipsaw this is meant to prevent.
+    """
+    if len(candles) < 10 or day_high is None or day_high <= 0:
+        return False
+
+    touches = 0
+    ever_genuinely_cleared = False
+    in_touch = False
+    for c in candles:
+        near_high = c["high"] >= day_high * (1 - REPEATED_REJECTION_TOUCH_PCT)
+        if near_high and not in_touch:
+            touches += 1
+            in_touch = True
+        elif not near_high:
+            in_touch = False
+        if c["close"] >= day_high * (1 + REPEATED_REJECTION_CLEAR_PCT):
+            ever_genuinely_cleared = True
+
+    return touches >= REPEATED_REJECTION_MIN_TOUCHES and not ever_genuinely_cleared
+
+
 def is_extended_and_rolling_over(candles, pct_change):
     """For stocks already up huge (300%+), pause new entries if it's actively
     pushing down/bearish - these tend to crash hard once they turn. Applies
@@ -717,6 +770,14 @@ def evaluate_entry(symbol, day_high, pct_change=None):
         return "downtrend_wait", strength, structure_score
     if is_staircasing_down(candles):
         return "staircase_wait", strength, structure_score
+    # Repeated-rejection check: if this stock has tested its daily high
+    # several separate times today and gotten rejected every time without
+    # ever genuinely closing above it, this is a rollercoaster/chop pattern,
+    # not a coiling breakout - block entry even on the FIRST attempt, since
+    # waiting for a stop-out first defeats the purpose (that first entry
+    # would already be buying the same chop that's been rejecting all day).
+    if is_repeated_high_rejection(candles, day_high):
+        return "repeated_rejection_wait", strength, structure_score
 
     entry_state = get_symbol_entry_state(symbol)
     stop_out_count = entry_state["stop_out_count"]
@@ -725,6 +786,7 @@ def evaluate_entry(symbol, day_high, pct_change=None):
     # for a split second on pure noise and immediately fall back - a close
     # above the level means price actually settled there.
     latest_close = candles[-1]["close"]
+    required_buffer = reentry_breakout_buffer(pct_change)
 
     # 1st attempt on this symbol: either a reclaim-of-prior-high or a fresh
     # breakout is a valid trigger - this is "buy when it comes back up to
@@ -737,23 +799,26 @@ def evaluate_entry(symbol, day_high, pct_change=None):
     # the level that stopped us out last time by a real margin - not just a
     # brief wick poke above the old high, which on choppy, volatile symbols
     # like FCUV was getting cleared by pure noise and causing the bot to
-    # whipsaw in and out of the same range repeatedly.
+    # whipsaw in and out of the same range repeatedly. The required margin
+    # scales up for stocks already extended 250%+ on the day, since those
+    # swing much harder and a small buffer is still just noise for them.
     elif stop_out_count == 1:
         last_stopped_high = entry_state.get("last_stopped_high")
         cleared_with_buffer = (
             last_stopped_high is None
-            or latest_close > last_stopped_high * (1 + REENTRY_BREAKOUT_BUFFER_PCT)
+            or latest_close > last_stopped_high * (1 + required_buffer)
         )
         if breakout and cleared_with_buffer:
             return "enter", strength, structure_score
     # After 2+ stop-outs: require a genuinely NEW breakout, meaning the
     # CLOSE has to clear the level where it previously got stopped out by a
-    # real margin, not just repeat the same failed high with a brief wick.
+    # real margin (scaled the same way for extended stocks), not just
+    # repeat the same failed high with a brief wick.
     else:
         last_stopped_high = entry_state.get("last_stopped_high")
         cleared_with_buffer = (
             last_stopped_high is None
-            or latest_close > last_stopped_high * (1 + REENTRY_BREAKOUT_BUFFER_PCT)
+            or latest_close > last_stopped_high * (1 + required_buffer)
         )
         if breakout and cleared_with_buffer:
             return "enter", strength, structure_score
@@ -767,13 +832,20 @@ def evaluate_entry(symbol, day_high, pct_change=None):
 
 
 def save_account_state():
-    """Persists cash + open positions to disk so a redeploy/restart never
-    wipes progress. Only resets when the user explicitly clicks Reset."""
+    """Persists cash + open positions + per-symbol entry strictness memory
+    to disk so a redeploy/restart, or a second browser tab, never silently
+    wipes out how many times a symbol has been stopped out. Without saving
+    symbol_entry_states here, a restart (or an out-of-sync tab) resets every
+    symbol's stop-out count back to 0, letting the bot re-buy on a plain
+    reclaim instead of requiring the stricter breakout - which looked like
+    the bot "never learning" and repeatedly re-entering the same loser.
+    Only resets when the user explicitly clicks Reset."""
     try:
         state = {
             "cash": st.session_state.cash,
             "positions": st.session_state.positions,
             "cycle_count": st.session_state.cycle_count,
+            "symbol_entry_states": st.session_state.get("symbol_entry_states", {}),
         }
         with open(ACCOUNT_STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
@@ -1129,6 +1201,8 @@ def scan_and_enter(all_movers):
             log_line(f"{cand['symbol']} is extended ({cand['pct_change']:.0f}%) and pushing down - holding off until it stabilizes")
         elif status == "staircase_wait":
             log_line(f"{cand['symbol']} is staircasing down (bounce, break down, bounce, break down) - each bounce weaker than the last, skipping until that stops")
+        elif status == "repeated_rejection_wait":
+            log_line(f"{cand['symbol']} has tested its daily high multiple times and been rejected every time (rollercoaster chop, no real breakout) - skipping")
         scored_candidates.append((cand, status, strength, structure_score))
 
     scored_candidates.sort(key=lambda t: t[3], reverse=True)
@@ -1182,10 +1256,12 @@ if "cash" not in st.session_state:
         st.session_state.cash = saved_state.get("cash", PAPER_STARTING_CASH)
         st.session_state.positions = saved_state.get("positions", [])
         st.session_state.cycle_count = saved_state.get("cycle_count", 0)
+        st.session_state.symbol_entry_states = saved_state.get("symbol_entry_states", {})
     else:
         st.session_state.cash = PAPER_STARTING_CASH
         st.session_state.positions = []
         st.session_state.cycle_count = 0
+        st.session_state.symbol_entry_states = {}
     st.session_state.trade_log = []
     st.session_state.trade_markers = []
     st.session_state.activity_log = []
@@ -1200,6 +1276,9 @@ else:
         st.session_state.cash = fresh_state.get("cash", st.session_state.cash)
         st.session_state.positions = fresh_state.get("positions", st.session_state.positions)
         st.session_state.cycle_count = fresh_state.get("cycle_count", st.session_state.cycle_count)
+        st.session_state.symbol_entry_states = fresh_state.get(
+            "symbol_entry_states", st.session_state.get("symbol_entry_states", {})
+        )
 
 st.title("Live Momentum Bot - Paper Trading Dashboard")
 st.caption("PAPER TRADING ONLY. Real, live market data. No real brokerage orders are ever placed. Not financial advice.")
