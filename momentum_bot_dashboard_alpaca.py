@@ -275,6 +275,7 @@ REGULAR_MARKET_OPEN = 9.5
 REGULAR_MARKET_CLOSE = 16.0
 AFTERHOURS_CLOSE = 20.0  # bot now keeps managing/trading through 8 PM ET
 FLATTEN_HOUR = 17.0  # 5:00 PM ET - hard flatten, close every open position, no exceptions
+PREMARKET_SCAN_OPEN = 9.0  # 9:00 AM ET - watchlist scanning starts here, trading still locked
 
 
 def market_is_open():
@@ -282,6 +283,14 @@ def market_is_open():
     still real movement/volume worth trading after 4 PM."""
     hour = get_et_hour_float()
     return REGULAR_MARKET_OPEN <= hour < AFTERHOURS_CLOSE
+
+
+def in_premarket_scan_window():
+    """True from 9:00 AM up to the 9:30 AM open - lets the watchlist build
+    and populate early so it's ready the instant trading unlocks, but does
+    NOT allow any buys to fire yet (see main cycle gate below)."""
+    hour = get_et_hour_float()
+    return PREMARKET_SCAN_OPEN <= hour < REGULAR_MARKET_OPEN
 
 
 def in_afterhours_session():
@@ -1317,7 +1326,7 @@ if st.session_state.manual_watchlist:
                 st.write(f"{sym}: no quote returned from the data feed")
 
 # --- One full strategy cycle runs every rerun ---
-if market_is_open():
+if market_is_open() or in_premarket_scan_window():
     raw_gainers = fetch_top_gainers()
     movers, approaching = get_top_movers()
     manual_entries = get_manual_watchlist_entries()
@@ -1325,8 +1334,15 @@ if market_is_open():
     for entry in manual_entries:
         if entry["symbol"] not in existing_symbols:
             movers.append(entry)
-    manage_open_positions(movers)
-    scan_and_enter(movers)
+    if market_is_open():
+        # Regular trading hours - full cycle, including live entries.
+        manage_open_positions(movers)
+        scan_and_enter(movers)
+    else:
+        # 9:00-9:30 AM ET pre-market scan window: build/refresh the
+        # watchlist so it's warmed up and ready, but do NOT place any
+        # buys yet - trading only unlocks once market_is_open() is True.
+        log_line(f"Pre-market scan: watchlist built ({len(movers)} symbols) - trading opens at 9:30 AM ET.")
     st.session_state.cycle_count += 1
 else:
     raw_gainers = []
