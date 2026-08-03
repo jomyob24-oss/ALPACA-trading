@@ -1089,17 +1089,32 @@ def place_sell(pos, reason, already_filled_price=None):
     save_account_state()
 
 
+STOP_FILL_CHECK_INTERVAL_SECONDS = 1.0  # only poll Alpaca for stop-order fills this often, not every 0.25s refresh
+
+
 def manage_open_positions(all_movers):
     flatten_now = past_flatten_time()
+    stop_check_times = st.session_state.setdefault("stop_check_times", {})
     for pos in list(st.session_state.positions):
         # First check whether the resting stop order itself already filled
         # on the exchange since our last poll (e.g. a sharp gap that hit the
         # stop between refresh cycles) - if so, just record it and move on,
         # rather than placing a second, redundant sell.
-        filled_price = check_alpaca_order_filled(pos.get("stop_order_id"))
-        if filled_price is not None:
-            place_sell(pos, reason="stop hit (filled on exchange)", already_filled_price=filled_price)
-            continue
+        #
+        # Throttled to once per STOP_FILL_CHECK_INTERVAL_SECONDS instead of
+        # every single 0.25s refresh cycle - a stop fill doesn't need to be
+        # detected four times a second, and this call was adding meaningful
+        # extra load on top of the live price stream, which is what was
+        # tripping Streamlit's free-tier CPU throttle.
+        pos_key = pos.get("stop_order_id") or pos["symbol"]
+        last_check = stop_check_times.get(pos_key, 0.0)
+        now_ts = _time.time()
+        if now_ts - last_check >= STOP_FILL_CHECK_INTERVAL_SECONDS:
+            stop_check_times[pos_key] = now_ts
+            filled_price = check_alpaca_order_filled(pos.get("stop_order_id"))
+            if filled_price is not None:
+                place_sell(pos, reason="stop hit (filled on exchange)", already_filled_price=filled_price)
+                continue
 
         q = fetch_quote(pos["symbol"])
         if not q:
